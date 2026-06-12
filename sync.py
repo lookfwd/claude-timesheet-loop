@@ -4,48 +4,54 @@ sync.py — output side of the claude-code -> calendar logger.
 
 Takes the model's headline map for changed slots and upserts a 2-hour event per
 slot onto a dedicated calendar, matching existing events BY TIME WINDOW. It only
-ever touches events it created itself, identified by an extendedProperties marker
-(extendedProperties.private.claudecode == MARKER). Events in the same window
-without that marker are left alone — the tool inserts its own alongside them and
-never edits or deletes another layer/event.
+ever touches events it created itself, identified by an extendedProperties
+marker (extendedProperties.private.claudecode == "1"). Events in the same
+window without that marker are left alone — the tool inserts its own alongside
+them and never edits or deletes another layer/event.
 
-On a successful push it atomically commits the cache: raw.json (the source
-snapshot from extract.py) and headlines.json (the new headlines). If the push
+On a successful push it commits the cache: <cache>/raw.pending.json (written by
+extract.py) is promoted to raw.json, and headlines.json is merged. If the push
 fails, nothing is committed, so the next extract run still sees the delta.
 
 Input (stdin or --in), JSON:
 {
-  "headlines": { "2025-06-12T14:00:00-07:00": "OAuth, Calendar sync", ... },
-  "_snapshot": { ... }   # passed straight through from extract.py
+  "headlines": { "2026-06-12T14:00:00-04:00": "OAuth, Calendar Sync", ... }
 }
 
 A slot mapped to "" or null means "delete my event in that slot" (only mine).
+Slots omitted from the map are left untouched.
 
-Calendar selection: --calendar-id (default "claude code" by summary lookup, or
-create it if missing — only when --create-calendar is passed).
+Calendar selection: --calendar-id, or lookup by summary "Claude Code"
+(created if missing when --create-calendar is passed).
 
-Requires: google-api-python-client, google-auth-httplib2, google-auth-oauthlib
-(the official Google-maintained client — confirm current versions yourself).
+events.list window semantics (per the official API reference): timeMin is an
+exclusive lower bound on the event's END, timeMax an exclusive upper bound on
+its START — so querying [slot_start, slot_end] can't return adjacent slots'
+events. The exact-start instant match below additionally disambiguates the
+DST fall-back hour, where two distinct slot keys overlap in real time.
+
+Requires: google-api-python-client google-auth-httplib2 google-auth-oauthlib
 Auth: OAuth user creds cached at <cache>/token.json; client secrets at
---client-secret (default <cache>/credentials.json). Scope: calendar (read/write).
+--client-secret (default <cache>/credentials.json). Scope: calendar.
 
-CONFIRM AGAINST LIVE API: events.list timeMin/timeMax semantics (it returns
-events that *overlap* the window, not only those starting in it), and that
-privateExtendedProperty filtering is supported on list. Both are standard, but
-verify.
+--dry-run authenticates and READS the calendar to print the exact op per slot
+(insert/patch/delete/skip-identical/skip-no-event) but writes and commits
+nothing.
 """
 
 import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 
 SLOT_HOURS = 2
 MARKER_KEY = "claudecode"
 MARKER_VAL = "1"
-DEFAULT_CAL_SUMMARY = "claude code"
+DEFAULT_CAL_SUMMARY = "Claude Code"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+PENDING_STALE_SECS = 3600
 
 
 def _eprint(*a):
@@ -60,15 +66,27 @@ def _load_creds(cache, client_secret):
     token_path = os.path.join(cache, "token.json")
     creds = None
     if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        except ValueError:
+            creds = None
+    if creds and not creds.valid and creds.expired and creds.refresh_token:
+        try:
             creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(client_secret, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+        except Exception as e:  # revoked/expired refresh token -> re-consent
+            _eprint(f"token refresh failed ({e}); falling back to browser flow")
+            creds = None
+    if not creds or not creds.valid:
+        if not os.path.exists(client_secret):
+            raise SystemExit(
+                f"OAuth client secret not found at {client_secret}. Create a "
+                f"Desktop OAuth client in Google Cloud Console (Calendar API "
+                f"enabled) and download its JSON there, or pass --client-secret."
+            )
+        flow = InstalledAppFlow.from_client_secrets_file(client_secret, SCOPES)
+        creds = flow.run_local_server(port=0)
+    with open(token_path, "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
     return creds
 
 
@@ -100,17 +118,13 @@ def _resolve_calendar(svc, calendar_id, create):
 
 def _slot_bounds(slot_iso):
     start = datetime.fromisoformat(slot_iso)
-    end = start + timedelta(hours=SLOT_HOURS)
-    return start, end
+    if start.tzinfo is None:
+        raise SystemExit(f"slot key {slot_iso!r} has no UTC offset")
+    return start, start + timedelta(hours=SLOT_HOURS)
 
 
 def _find_my_event(svc, cal_id, start, end):
-    """Return my marked event whose start matches this slot, or None.
-
-    Filters by the private extended property so only our own events come back,
-    then matches exact start to avoid the overlap-window catching an adjacent
-    slot's event.
-    """
+    """Return my marked event whose start matches this slot instant, or None."""
     resp = svc.events().list(
         calendarId=cal_id,
         timeMin=start.isoformat(),
@@ -135,51 +149,61 @@ def _event_body(start, end, title):
     }
 
 
-def sync(svc, cal_id, headlines):
-    """Apply headlines. Returns (inserted, updated, deleted, skipped)."""
-    ins = upd = dele = skip = 0
-    for slot_iso, title in headlines.items():
-        start, end = _slot_bounds(slot_iso)
-        existing = _find_my_event(svc, cal_id, start, end)
-        clean_title = (title or "").strip()
+def _plan(svc, cal_id, slot_iso, title):
+    """Decide the op for one slot. Returns (op, existing_event_or_None)."""
+    start, end = _slot_bounds(slot_iso)
+    existing = _find_my_event(svc, cal_id, start, end)
+    clean = (title or "").strip()
+    if not clean:
+        return ("delete" if existing else "skip-no-event"), existing
+    if existing:
+        if existing.get("summary") == clean:
+            return "skip-identical", existing
+        return "patch", existing
+    return "insert", None
 
-        if not clean_title:
-            if existing:
-                svc.events().delete(calendarId=cal_id, eventId=existing["id"]).execute()
-                dele += 1
-            else:
-                skip += 1
+
+def sync(svc, cal_id, headlines, dry_run):
+    """Apply (or with dry_run just print) the planned op per slot."""
+    counts = {"insert": 0, "patch": 0, "delete": 0,
+              "skip-identical": 0, "skip-no-event": 0}
+    for slot_iso, title in sorted(headlines.items()):
+        op, existing = _plan(svc, cal_id, slot_iso, title)
+        counts[op] += 1
+        clean = (title or "").strip()
+        if dry_run:
+            _eprint(f"[dry-run] {op:<14} {slot_iso}  ->  {clean!r}")
             continue
-
-        if existing:
-            if existing.get("summary") == clean_title:
-                skip += 1  # no-op: headline unchanged
-                continue
-            existing["summary"] = clean_title
-            svc.events().update(
-                calendarId=cal_id, eventId=existing["id"], body=existing
+        start, end = _slot_bounds(slot_iso)
+        if op == "delete":
+            svc.events().delete(calendarId=cal_id, eventId=existing["id"]).execute()
+        elif op == "patch":
+            svc.events().patch(
+                calendarId=cal_id, eventId=existing["id"], body={"summary": clean}
             ).execute()
-            upd += 1
-        else:
+        elif op == "insert":
             svc.events().insert(
-                calendarId=cal_id, body=_event_body(start, end, clean_title)
+                calendarId=cal_id, body=_event_body(start, end, clean)
             ).execute()
-            ins += 1
-    return ins, upd, dele, skip
+    return counts
 
 
-def _commit_cache(cache, snapshot, headlines):
-    """Atomically write raw.json and merge headlines.json after success."""
+def _commit_cache(cache, headlines):
+    """Promote raw.pending.json -> raw.json and merge headlines.json."""
+    pending = os.path.join(cache, "raw.pending.json")
     raw_path = os.path.join(cache, "raw.json")
     head_path = os.path.join(cache, "headlines.json")
 
-    if snapshot is not None:
-        tmp = raw_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, raw_path)
+    if os.path.exists(pending):
+        age = time.time() - os.path.getmtime(pending)
+        if age > PENDING_STALE_SECS:
+            _eprint(f"warning: raw.pending.json is {int(age // 60)} min old — "
+                    f"is the loop running extract right before sync?")
+        os.replace(pending, raw_path)
+    else:
+        _eprint("warning: raw.pending.json missing — snapshot not committed "
+                "(harmless if re-running sync after a success)")
 
-    # Merge: keep prior headlines, apply new ones, drop the ones we deleted ("").
     prior = {}
     if os.path.exists(head_path):
         with open(head_path, "r", encoding="utf-8") as f:
@@ -188,8 +212,9 @@ def _commit_cache(cache, snapshot, headlines):
             except json.JSONDecodeError:
                 prior = {}
     for slot, title in headlines.items():
-        if (title or "").strip():
-            prior[slot] = title.strip()
+        clean = (title or "").strip()
+        if clean:
+            prior[slot] = clean
         else:
             prior.pop(slot, None)
     tmp = head_path + ".tmp"
@@ -207,7 +232,7 @@ def main():
     ap.add_argument("--create-calendar", action="store_true")
     ap.add_argument("--client-secret", default=None)
     ap.add_argument("--dry-run", action="store_true",
-                    help="Print planned actions without calling the API")
+                    help="Authenticate and read, but write and commit nothing")
     args = ap.parse_args()
 
     os.makedirs(args.cache, exist_ok=True)
@@ -215,27 +240,26 @@ def main():
 
     payload = json.load(open(args.infile) if args.infile else sys.stdin)
     headlines = payload.get("headlines", {})
-    snapshot = payload.get("_snapshot")
-
-    if args.dry_run:
-        for slot, title in sorted(headlines.items()):
-            start, end = _slot_bounds(slot)
-            verb = "DELETE(mine)" if not (title or "").strip() else "UPSERT(mine)"
-            _eprint(f"{verb} {start.isoformat()}  ->  {title!r}")
-        _eprint(f"[dry-run] {len(headlines)} slot(s); cache not committed")
+    if not headlines:
+        _eprint("no headlines in input; nothing to do (cache not committed)")
         return
 
     creds = _load_creds(args.cache, client_secret)
     svc = _service(creds)
     cal_id = _resolve_calendar(svc, args.calendar_id, args.create_calendar)
 
-    ins, upd, dele, skip = sync(svc, cal_id, headlines)
+    counts = sync(svc, cal_id, headlines, args.dry_run)
 
-    # Only commit if the push didn't raise. (sync raises on API error, which
-    # skips this line, leaving the delta intact for the next run.)
-    _commit_cache(args.cache, snapshot, headlines)
+    if args.dry_run:
+        _eprint(f"[dry-run] {len(headlines)} slot(s); nothing written, "
+                f"cache not committed")
+        return
 
-    _eprint(f"inserted={ins} updated={upd} deleted={dele} skipped={skip} cal={cal_id}")
+    # Only reached if no API call raised; a failed push commits nothing and
+    # the next extract run re-emits the delta.
+    _commit_cache(args.cache, headlines)
+
+    _eprint("  ".join(f"{k}={v}" for k, v in counts.items()) + f"  cal={cal_id}")
 
 
 if __name__ == "__main__":
